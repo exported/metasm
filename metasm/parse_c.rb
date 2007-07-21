@@ -9,108 +9,305 @@ require 'metasm/preprocessor'
 
 module Metasm
 # c parser
-# http://www.csci.csusb.edu/dick/samples/c.syntax.html
+# inspired from http://www.math.grin.edu/~stone/courses/languages/C-syntax.xhtml
 class CParser
-	class Variable
-		attr_accessor :name, :type, :initializer
-	end
-	class Function
-		# arguments => Variable
-		attr_accessor :name, :return_type, :args, :scope
-	end
-	class Struct
-		# Variable
-		attr_accessor :members, :bits
-	end
-	class Type
-		attr_accessor :type, :modifiers
-		def initialize(type=nil)
-			@type = type
+	class Block
+		# name => obj
+		attr_accessor :variable	# hash name => Variable
+		attr_accessor :type	# hash typedefd name => Type
+		attr_accessor :struct	# hash name => Type
+		attr_accessor :enum	# hash enum name => value
+		attr_accessor :outer	# parent block
+		attr_accessor :statements	# array of CExpr/If../Continue../Goto/Label
+
+		def initialize(outer)
+			@variable, @type, @struct, @enum = {}, {}, {}, {}
+			@statements = []
+			@outer = outer
 		end
-		def ==(o)
-			o.kind_of? Type and o.type == @type
+
+		def variable_ancestors
+			(outer ? outer.variable_ancestors : {}).merge @variables
 		end
+		def type_ancestors
+			(outer ? outer.type_ancestors : {}).merge @types
+		end
+		def struct_ancestors
+			(outer ? outer.struct_ancestors : {}).merge @struct
+		end
+		def enum_ancestors
+			(outer ? outer.enum_ancestors : {}).merge @enum
+		end
+	end
+
+	class Variable < Declaration
+		attr_accessor :type, :initializer
+		attr_accessor :name
+		attr_accessor :attributes
+		attr_accessor :storage		# auto register static extern
+	end
+
+	class Type < Declaration
+		attr_accessor :qualifier	# const volatile
+	end
+	class BaseType < Type
+		attr_accessor :name
+		attr_accessor :attributes
+	end
+	class FunctionType < Type
+		attr_accessor :return_type
+		attr_accessor :args_type
+
+		def initialize(rt)
+			@return_type = rt
+			@args_type = []
+		end
+	end
+	class Union < Type
+		# [[name, Type, bits=nil], ...]
+		attr_accessor :members
+		attr_accessor :attributes
+	end
+	class Struct < Union
+		attr_accessor :align
+	end
+	class Enum < Type
+		# hash name => value
+		attr_accessor :values
 	end
 	class Pointer < Type
+		attr_accessor :type
 	end
 	class Array < Type
+		attr_accessor :type
 		attr_accessor :length
 	end
 
-	class Union
-		attr_accessor :members
-	end
-	class Enum
-		attr_accessor :values
-	end
-	class Scope
-		attr_accessor :parent, :variables, :content
-		def initialize(parent)
-			@parent, @variables, @content = parent, {}, []
-		end
-		def find_var(name)
-			@variables[name] || (@parent.find_var(name) if @parent)
+	class Function
+		attr_accessor :type	# FunctionType
+		attr_accessor :args	# array of Variables
+		attr_accessor :varargs	# true/false
+		attr_accessor :attributes
+		attr_accessor :name
+		attr_accessor :body
+
+		# parser helper
+		def initialize(var)
+			@name = var.name
+			@type = FunctionType.new(var.type)
+			@args = []
+			@attributes = var.attributes
 		end
 	end
 	class If
-		attr_accessor :condition, :then, :else
+		# expression
+		attr_accessor :test
+		# blocks
+		attr_accessor :then, :else
 	end
 	class For
-		attr_accessor :setup, :condition, :iter, :body
+		# expressions
+		attr_accessor :init, :test, :iter
+		attr_accessor :scope, :body
+		# scope used for init
 	end
 	class While
-		attr_accessor :condition, :body, :is_do_while
+		attr_accessor :test
+		attr_accessor :body
 	end
+	class DoWhile < While
+	end
+	class Switch
+		attr_accessor :test, :body
+	end
+
+	class Continue
+	end
+	class Break
+	end
+	class Goto
+		attr_accessor :target
+	end
+	class Return
+		# CExpr
+		attr_accessor :value
+	end
+	class Label
+		attr_accessor :name
+	end
+	class Case
+		attr_accessor :case
+	end
+
 	class CExpression
+		# op may be :,, :., :->, :funcall (funcname, :funcall, [arglist]), :cast (type, :cast, expr)
+		# XXX cast to fnptr
 		attr_accessor :lexpr, :op, :rexpr
 		def initialize(l, o, r)
 			@lexpr, @op, @rexpr = l, o, r
 		end
 	end
 
-	attr_accessor :lexer, :type, :scope
+	# creates a new CParser, parses all top-level statements
+	def self.parse(text, file='unknown', lineno=1)
+		c = new
+		c.lexer.feed text, file, lineno
+		while not c.lexer.eos?
+			c.parse_toplevel
+		end
+		c.sanity_checks
+		c
+	end
+
+	attr_accessor :lexer, :toplevel
 	def initialize
 		@lexer = Preprocessor.new(self)
-		@type = {}
-		@scope = Scope.new(:global)
+		@toplevel = Block.new(nil)
 	end
 
-	def allscope
-		@scope.inject({}) { |h, s| h.update s }
+	# C sanity checks
+	#  typedef are not initialized
+	#  no addr of register-class variable is taken
+	#  toplevel initializers are constants
+	#  etc
+	#  TODO
+	def sanity_checks
 	end
 
-	def parse(text, file='<ruby>', lineno=0)
-		@lexer.feed text, file, lineno
-		@curscope = @scope
+	# returns the next non-space/non-eol token
+	def skipspaces
+		nil while tok = @lexer.readtok and (tok.type == :space or tok.type == :eol)
+		tok
+	end
 
-		while not @lexer.eos?
-			parse_toplevel
+	Reserved = %w[struct union enum
+			register extern auto static typedef  const volatile
+			int float double char  signed unsigned long short
+	].inject({}) { |h, w| h.update w => true }
+
+	# root of the state machine
+	# XXX __attributes__ ?
+	# XXX forward struct declaration ?
+	def parse_toplevel
+		basetype = Variable.new
+		parse_type(@toplevel, basetype)
+		nofunc = false
+		loop do
+			var = basetype.dup
+			parse_declarator(@toplevel, var)
+			raise @lexer if not tok = skipspaces
+
+			case tok.raw
+			when '(':
+				raise tok if nofunc
+				var = Function.new(var)
+				parse_function_arglist(@toplevel, var)
+				raise @lexer if not tok = skipspaces
+				case tok.raw
+				when ';'
+				when '{': parse_function_body(@toplevel, var)
+				else raise tok
+				end
+				break
+			when '=':
+				raise tok if var.storage and var.storage.include?(:typedef)
+				parse_initializer(@toplevel, var)
+				raise @lexer if not tok = skipspaces
+			end
+
+			case tok.raw
+			when ';': break
+			when ',': nofunc = true
+			else raise tok
+			end
 		end
 	end
 
-	# check if a word is an invalid variable name
-	def reserved(w)
-		@type[w] or %w[struct union enum register const volatile static extern].include? a.raw
+	# parses var base type/qualifier/storage
+	def parse_type(scope, var)
+		qualifier = nil
+		loop do
+			raise @lexer if not tok = skipspaces
+			raise tok if tok.type != :string
+			case tok.raw
+			when 'const', 'volatile'
+				(qualifier ||= []) << tok.raw.to_sym
+				next
+			when 'register', 'auto', 'static', 'typedef', 'extern'
+				(var.storage ||= []) << tok.raw.to_sym
+				next
+			when 'struct'
+				var.type = Struct.new
+				var.type.align = @lexer.pragma_pack
+				parse_type_unionstruct(scope, var)
+			when 'union'
+				var.type = Union.new
+				parse_type_unionstruct(scope, var)
+			when 'enum'
+				var.type = Enum.new
+				parse_type_enum(scope, var)
+			else
+				raise tok if not var.type = scope.type_ancestors[tok.raw]
+			end
+
+			break
+		end
+		var.type.qualifier = qualifier if qualifier
 	end
 
-	def readtok(tok, opttype=nil)
-		@lexer.skip_space_eol
-		raise tok if not ntok = @lexer.readtok or (opttype and ntok.type != opttype)
-		ntok
+	# parses a structure/union declaration
+	def parse_type_unionstruct(scope, var)
+		raise @lexer if not tok = skipspaces
+		if tok.type == :string
+			name = tok.raw
+			raise tok if Reserved[name]
+			tok = skipspaces
+			if tok.type == :string or tok.foo
+			if scope.ancest_struct[name]
+			end
+			end
+		end
 	end
 
-	# typedef / var declaration/definition / function decl/def
-	# XXX __attributes__ ?
-	def parse_toplevel
-		@lexer.skip_space_eol
-		return if not tok = @lexer.readtok
-		raise tok if tok.type != :string
+	def parse_enum(scope)
+		raise @lexer if not tok = skipspaces
+	end
 
-		case tok.raw
-		when 'typedef'
-			parse_typedef tok
-			return 
-		when 'union'
+	# parses a variable name, may include pointer/array specification with qualifiers
+	# does not parse initializer
+	def parse_declarator(scope, var)
+		raise @lexer if not tok = skipspaces
+		if tok.type == :punct and tok.raw == '*'
+			var.type = Pointer.new(var.type)
+			raise @lexer if not tok = skipspace
+			if tok.type == :string and (tok.raw == 'const' or tok.raw == 'volatile')
+				(tok.type.qualifier ||= []) << tok.raw.to_sym
+				# allow many ?
+			end
+		end
+		raise tok if tok.type != :string or Reserved[tok.raw]
+		tok.name = tok.raw
+		loop do
+			raise @lexer if not tok = skipspaces
+			if tok.type != :punct or tok.raw != '['
+				@lexer.unreadtok tok
+				break 
+			end
+			var.type = Array.new(var.type)
+			var.length = parse_cexpr_single(scope)
+			raise @lexer if not tok = skipspaces
+			raise tok if tok.type != :punct or tok.raw != ']'
+		end
+	end
+
+# XXX undone XXX #
+# XXX undone XXX #
+# XXX undone XXX #
+# XXX undone XXX #
+
+			u = parse_union
+
+			parse_union @toplevel.scope
 			type = parse_union tok
 			ntok = readtok(tok)
 			return if ntok.type == :punct and ntok.raw == ';'
@@ -351,9 +548,8 @@ class CParser
 			end
 		end
 	end
-end
 
-class Expression
+	class CExpression
 	class << self
 		# key = operator, value = hash regrouping operators of lower precedence
 		OP_PRIO = [[:'||'], [:'&&'], [:'<', :'>', :'<=', :'>=', :'==', :'!='],
@@ -409,87 +605,9 @@ class Expression
 			op
 		end
 
-		# parses an integer/a float, sets its tok.value, consumes&aggregate necessary following tokens (point, mantissa..)
-		# handles $/$$ special asm label name
+		# parse sizeof offsetof etc
 		def parse_intfloat(lexer, tok)
-			if tok.raw == '$' and lexer.program
-				if not (l = lexer.program.cursource.last).kind_of? Label
-					l = Label.new(lexer.program.new_label('instr_start'))
-					l.backtrace = tok.backtrace.dup
-					lexer.program.cursource << l
-				end
-				tok.value = l.name
-				return
-			elsif tok.raw == '$$' and lexer.program
-				if not (l = lexer.program.cursource.first).kind_of? Label
-					l = Label.new(lexer.program.new_label('section_start'))
-					l.backtrace = tok.backtrace.dup
-					lexer.program.cursource.unshift l
-				end
-				tok.value = l.name
-				return
-			end
-
-			if not tok.value and tok.type == :punct and tok.raw == '.'
-				# bouh
-				ntok = lexer.readtok_nopp
-				lexer.unreadtok ntok
-				if ntok and ntok.type == :string and ntok.raw =~ /^[0-9][0-9e_]*$/ and ntok.raw.count('e') <= 1
-					point = tok.dup
-					lexer.unreadtok point
-					tok.raw = '0'
-					tok.type = :string
-				end
-			end
-
-			return if tok.value or not (?0..?9).include? tok.raw[0]
-
-			case tok.raw
-			when /^0b([01_]+)$/, /^([01_]+)b$/
-				tok.value = $1.to_i(2)
-			when /^(0[0-7_]+)$/
-				tok.value = $1.to_i(8)
-			when /^0x([a-fA-F0-9_]+)$/, /^([0-9][a-fA-F0-9_]*)h$/
-				tok.value = $1.to_i(16)
-			when /^[0-9_]+$/
-				if ntok = lexer.readtok_nopp and ntok.type == :punct and ntok.raw == '.'
-					# parse float
-					tok.raw << ntok.raw
-					ntok = lexer.readtok_nopp
-					# XXX 1.0e2 => '1', '.', '0e2'
-					raise tok, 'invalid float'+ntok.raw.inspect if not ntok or ntok.type != :string or ntok.raw !~ /^[0-9][0-9_e]*$/ or ntok.raw.count('e') > 1
-					if ntok.raw.include? 'e'
-						ntok.raw, post = ntok.raw.split('e', 2)
-						if post.length > 0
-							t = ntok.dup
-							t.raw = post
-							lexer.unreadtok t
-						end
-						t = ntok.dup
-						t.raw = 'e'
-						lexer.unreadtok t
-					end
-					tok.raw << ntok.raw
-
-					if ntok = lexer.readtok_nopp and ntok.type == :string and ntok.raw == 'e'
-						tok.raw << ntok.raw
-						ntok = lexer.readtok_nopp
-						if ntok and ntok.type == :punct and (ntok.raw == '-' or ntok.raw == '+')
-							tok.raw << ntok.raw
-							ntok = lexer.readtok_nopp
-						end
-						raise tok, 'invalid float' if not ntok or ntok.type != :string or ntok.raw !~ /^[0-9_]+$/
-						tok.raw << ntok.raw
-					else
-						lexer.unreadtok ntok
-					end
-					tok.value = tok.raw.to_f
-				else
-					lexer.unreadtok ntok
-					tok.value = tok.raw.to_i
-				end
-			else raise tok, 'invalid integer'
-			end
+			Expression.parse_num_value(lexer, tok)
 		end
 
 		# returns the next value from lexer (parenthesised expression, immediate, variable, unary operators)
@@ -563,59 +681,9 @@ class Expression
 				stack << new(opstack.pop, stack.pop, stack.pop)
 			end
 
-			Expression[stack.first]
+			CExpression[stack.first]
 		end
-
-		# same as parsing an expression, but return the array of tokens instead of the Expression
-		def parse_toks(lexer)
-			raise lexer.nexttok, 'invalid expression' if not p1 = parse_value_toks(lexer)
-			while p2 = readop(lexer)
-				p1 << p2
-				while ntok = lexer.nexttok and (ntok.type == :space or ntok.type == :eol)
-					p1 << lexer.readtok
-				end
-				p3 = parse_value_toks(lexer)
-				raise p1.last, 'no right hand side expression member' if not p3
-				p1.concat p3
-			end
-			p1
-		end
-
-		def parse_value_toks(lexer)
-			ret = []
-			cancel = proc { ret.reverse_each { |t| lexer.unreadtok t } ; return }
-			ret << lexer.readtok while ntok = lexer.nexttok and ntok.type == :space
-			cancel[] if not tok = lexer.readtok
-			ret << tok
-			case tok.type
-			when :string
-				parse_intfloat(lexer, tok)
-			when :quoted
-				cancel[] if tok.raw[0] != ?'
-			when :punct
-				case tok.raw
-				when '('
-					ret << lexer.readtok while ntok = lexer.nexttok and (ntok.type == :space or ntok.type == :eol)
-					ret.concat parse_toks(lexer)
-					ret << lexer.readtok while ntok = lexer.nexttok and (ntok.type == :space or ntok.type == :eol)
-					raise tok, 'syntax error, no ) found' if not ntok = lexer.readtok or ntok.type != :punct or ntok.raw != ')'
-					ret << ntok
-				when '!', '+', '-', '~'
-					# unary operators
-					ret << lexer.readtok while ntok = lexer.nexttok and (ntok.type == :space or ntok.type == :eol)
-					raise tok, 'need expression after unary operator' if not val = parse_value_toks(lexer)
-					ret.concat val
-				when '.'
-					parse_intfloat(lexer, tok)
-					cancel[] if not tok.value
-				else cancel[]
-				end
-			else cancel[]
-			end
-			ret << lexer.readtok while ntok = lexer.nexttok and ntok.type == :space
-			ret
-		end
-
+	end
 	end
 end
 end
